@@ -1,10 +1,9 @@
 #define _POSIX_C_SOURCE 200809L
 
-#include <errno.h>
+#include <inttypes.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
-#include <string.h>
 #include <time.h>
 
 #include "bxi_pci_drv.h"
@@ -19,8 +18,12 @@ enum {
     POWER_OUTPUT_MASK = 1 << 2,
 };
 
+static const int64_t ns_per_second = 1000000000;
+static const int64_t ns_per_millisecond = 1000000;
+
 struct test_run {
     bool dry_run;
+    struct terminal_input input;
     unsigned simulated_power;
     struct timespec simulated_time;
     struct timespec started_at;
@@ -93,7 +96,12 @@ static int set_power(struct test_run *run, unsigned power, const char *phase)
     return 0;
 }
 
-/* Duration zero keeps the last state until the process is stopped. */
+static int64_t time_ns(struct timespec time)
+{
+    return time.tv_sec * ns_per_second + time.tv_nsec;
+}
+
+/* Duration zero holds this phase until quit or a stop signal. */
 static int wait_power(struct test_run *run, unsigned power, unsigned duration_s)
 {
     if (run->dry_run) {
@@ -101,28 +109,63 @@ static int wait_power(struct test_run *run, unsigned power, unsigned duration_s)
         return 0;
     }
 
-    struct timespec next_check = run->switched_at;
-    for (unsigned elapsed_s = 0; duration_s == 0 || elapsed_s < duration_s; ++elapsed_s) {
+    const bool timed = duration_s != 0;
+    bool paused = false;
+    int64_t remaining_ns = duration_s * ns_per_second;
+    int64_t deadline_ns = time_ns(run->switched_at) + remaining_ns;
+    int64_t next_check_ns = time_ns(run->switched_at) + ns_per_second;
+    while (!stop_signal) {
+        struct timespec now;
+        if (read_time(run, &now) != 0) {
+            return -1;
+        }
+        int64_t now_ns = time_ns(now);
+        if (now_ns >= next_check_ns) {
+            if (verify_power_output(run, paused ? 0 : power) != 0) {
+                return -1;
+            }
+            next_check_ns = now_ns + ns_per_second;
+        }
+        if (timed && !paused && now_ns >= deadline_ns) {
+            return 0;
+        }
+
+        int64_t wake_ns = timed && !paused && deadline_ns < next_check_ns ?
+                          deadline_ns : next_check_ns;
+        int timeout_ms = (int)((wake_ns - now_ns + ns_per_millisecond - 1) / ns_per_millisecond);
+        enum terminal_command command = terminal_wait_command(&run->input, timeout_ms);
         if (stop_signal) {
             return 1;
         }
-        ++next_check.tv_sec;
-        int error;
-        do {
-            error = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_check, NULL);
-        } while (error == EINTR && !stop_signal);
-        if (stop_signal) {
+        if (command == TERMINAL_ERROR) {
+            return -1;
+        }
+        if (command == TERMINAL_QUIT) {
+            puts("Quit requested.");
             return 1;
         }
-        if (error != 0) {
-            fprintf(stderr, "clock_nanosleep: %s\n", strerror(error));
-            return -1;
-        }
-        if (verify_power_output(run, power) != 0) {
-            return -1;
+        if (command == TERMINAL_STOP && !paused) {
+            if (set_power(run, 0, "Paused") != 0) {
+                return -1;
+            }
+            now_ns = time_ns(run->switched_at);
+            remaining_ns = timed && deadline_ns > now_ns ? deadline_ns - now_ns : 0;
+            paused = true;
+            next_check_ns = now_ns + ns_per_second;
+            if (timed) {
+                printf("Phase time remaining: %.3f s\n", (double)remaining_ns / ns_per_second);
+            }
+        } else if (command == TERMINAL_START && paused) {
+            if (set_power(run, power, "Resumed") != 0) {
+                return -1;
+            }
+            now_ns = time_ns(run->switched_at);
+            paused = false;
+            deadline_ns = now_ns + remaining_ns;
+            next_check_ns = now_ns + ns_per_second;
         }
     }
-    return 0;
+    return 1;
 }
 
 static int power_phase(struct test_run *run, unsigned power, unsigned duration_s, const char *phase)
@@ -171,9 +214,14 @@ static int run_test(struct test_run *run, const struct terminal_options *options
     }
 
     if (options->mode == TEST_MODE_BOTH) {
-        for (int round = 0; round < options->rounds; ++round) {
+        const bool unlimited = options->rounds == UNLIMITED_ROUNDS;
+        for (uint64_t round = 1; unlimited || round <= (uint64_t)options->rounds; ++round) {
             char group[48], hold[80];
-            snprintf(group, sizeof(group), "round %d/%d", round + 1, options->rounds);
+            if (unlimited) {
+                snprintf(group, sizeof(group), "round %" PRIu64 " (no_stop)", round);
+            } else {
+                snprintf(group, sizeof(group), "round %" PRIu64 "/%d", round, options->rounds);
+            }
             int status = run_cycles(run, options->cycles_per_group, group);
             if (status != 0) {
                 return status;
@@ -186,6 +234,10 @@ static int run_test(struct test_run *run, const struct terminal_options *options
             status = power_phase(run, 0, CYCLE_OFF_S, "Power-off before next group");
             if (status != 0) {
                 return status;
+            }
+            if (unlimited && run->dry_run) {
+                puts("DRY RUN: this round repeats indefinitely in no_stop mode.");
+                return 0;
             }
         }
     }
@@ -243,8 +295,9 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    terminal_input_init(&run.input);
     int status = run_test(&run, &options);
-    if (status > 0) {
+    if (status > 0 && stop_signal) {
         printf("Stop requested by signal %d.\n", (int)stop_signal);
     }
     int power_off_status = set_power(&run, 0, "Shutdown");

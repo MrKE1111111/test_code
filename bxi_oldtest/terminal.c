@@ -2,9 +2,11 @@
 
 #include "terminal.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,11 +33,13 @@ static void print_help(FILE *output, const char *program)
         "                            Every mode stays powered ON after completing its schedule.\n"
         "  --on_off_power COUNT      Power cycles per group (default %d).\n"
         "  --continuous_power SEC    Duration of each timed hold in seconds (default %d).\n"
-        "  --round COUNT             Alternating rounds (default %d, applies to bare --run).\n"
+        "  --round COUNT|no_stop     Alternating rounds (default %d), or repeat indefinitely.\n"
         "  --dry-run                 Preview the schedule without touching hardware or saving changes.\n"
         "  --help, -h                Show this help.\n"
         "\n"
-        "Settings require positive integers. They are saved individually to %s.\n"
+        "Foreground commands (press Enter): stop = pause and switch OFF,\n"
+        "start = resume, quit = switch OFF and exit.\n"
+        "Settings are saved individually to %s.\n"
         "Omitted settings retain their saved values, or defaults on first use.\n"
         "Settings alone do not start a test. Real runs require sudo.\n",
         program, DEFAULT_CYCLES, DEFAULT_HOLD_S, DEFAULT_ROUNDS, CONFIG_PATH);
@@ -53,6 +57,24 @@ static bool positive_integer(const char *text, int *value)
     }
     *value = (int)number;
     return true;
+}
+
+static bool parse_rounds(const char *text, int *rounds)
+{
+    if (strcmp(text, "no_stop") == 0) {
+        *rounds = UNLIMITED_ROUNDS;
+        return true;
+    }
+    return positive_integer(text, rounds);
+}
+
+static void format_rounds(int rounds, char text[32])
+{
+    if (rounds == UNLIMITED_ROUNDS) {
+        strcpy(text, "no_stop");
+    } else {
+        snprintf(text, 32, "%d", rounds);
+    }
 }
 
 static int load_settings(struct terminal_options *options)
@@ -87,7 +109,7 @@ static int load_settings(struct terminal_options *options)
                         cycles, hold, rounds, &extra);
     bool valid = fields == 3 && !ferror(file) &&
         positive_integer(cycles, &options->cycles_per_group) &&
-        positive_integer(hold, &options->hold_s) && positive_integer(rounds, &options->rounds);
+        positive_integer(hold, &options->hold_s) && parse_rounds(rounds, &options->rounds);
     fclose(file);
     if (!valid) {
         fprintf(stderr, "Invalid settings in %s\n", CONFIG_PATH);
@@ -112,8 +134,10 @@ static int save_settings(const struct terminal_options *options, int directory_f
         unlink(temporary_path);
         return -1;
     }
-    bool ok = fprintf(file, "on_off_power=%d\ncontinuous_power=%d\nround=%d\n",
-                      options->cycles_per_group, options->hold_s, options->rounds) >= 0 &&
+    char rounds[32];
+    format_rounds(options->rounds, rounds);
+    bool ok = fprintf(file, "on_off_power=%d\ncontinuous_power=%d\nround=%s\n",
+                      options->cycles_per_group, options->hold_s, rounds) >= 0 &&
         fflush(file) == 0 && fchmod(fd, 0644) == 0 && fsync(fd) == 0;
     if (!ok) {
         perror("Write " CONFIG_PATH);
@@ -159,8 +183,10 @@ static int apply_settings(struct terminal_options *options, int cycles, int hold
         if (save) {
             status = save_settings(options, directory_fd);
             if (status == 0) {
-                printf("Saved settings: on_off_power=%d continuous_power=%d s round=%d\n",
-                       options->cycles_per_group, options->hold_s, options->rounds);
+                char round_text[32];
+                format_rounds(options->rounds, round_text);
+                printf("Saved settings: on_off_power=%d continuous_power=%d s round=%s\n",
+                       options->cycles_per_group, options->hold_s, round_text);
             }
         }
     }
@@ -207,8 +233,11 @@ int terminal_parse(int argc, char *argv[], struct terminal_options *options)
                 fprintf(stderr, "Unknown or repeated option: %s (see --help)\n", arg);
                 return -1;
             }
-            if (++i >= argc || !positive_integer(argv[i], value)) {
-                fprintf(stderr, "%s requires a positive integer (up to %d)\n", arg, INT_MAX);
+            const bool round_option = value == &rounds;
+            if (++i >= argc || !(round_option ? parse_rounds(argv[i], value) :
+                                                positive_integer(argv[i], value))) {
+                fprintf(stderr, "%s requires a positive integer (up to %d)%s\n", arg, INT_MAX,
+                        round_option ? " or no_stop" : "");
                 return -1;
             }
         }
@@ -222,4 +251,75 @@ int terminal_parse(int argc, char *argv[], struct terminal_options *options)
         return -1;
     }
     return start || options->dry_run;
+}
+
+void terminal_input_init(struct terminal_input *input)
+{
+    *input = (struct terminal_input){ .enabled = isatty(STDIN_FILENO) == 1 };
+    if (input->enabled) {
+        puts("Type stop, start, or quit and press Enter.");
+    }
+}
+
+static enum terminal_command parse_command(struct terminal_input *input)
+{
+    if (input->discard_line) {
+        puts("Invalid command. Enter stop, start, or quit.");
+        return TERMINAL_NONE;
+    }
+
+    while (input->length > 0 && isspace((unsigned char)input->line[input->length - 1])) {
+        --input->length;
+    }
+    input->line[input->length] = '\0';
+    char *command = input->line;
+    while (isspace((unsigned char)*command)) {
+        ++command;
+    }
+    if (strcmp(command, "stop") == 0) return TERMINAL_STOP;
+    if (strcmp(command, "start") == 0) return TERMINAL_START;
+    if (strcmp(command, "quit") == 0) return TERMINAL_QUIT;
+    if (*command != '\0') {
+        puts("Unknown command. Enter stop, start, or quit.");
+    }
+    return TERMINAL_NONE;
+}
+
+enum terminal_command terminal_wait_command(struct terminal_input *input, int timeout_ms)
+{
+    struct pollfd fd = { .fd = input->enabled ? STDIN_FILENO : -1, .events = POLLIN };
+    int ready = poll(&fd, 1, timeout_ms);
+    if (ready == 0 || (ready < 0 && errno == EINTR)) return TERMINAL_NONE;
+    if (ready < 0) {
+        perror("Poll terminal input");
+        return TERMINAL_ERROR;
+    }
+    if (!(fd.revents & POLLIN)) {
+        input->enabled = false;
+        return TERMINAL_NONE;
+    }
+
+    char byte;
+    ssize_t count = read(STDIN_FILENO, &byte, 1);
+    if (count < 0) {
+        if (errno == EINTR || errno == EAGAIN) return TERMINAL_NONE;
+        perror("Read terminal input");
+        return TERMINAL_ERROR;
+    }
+    if (count == 0) {
+        input->enabled = false;
+        return TERMINAL_NONE;
+    }
+    if (byte == '\n') {
+        enum terminal_command command = parse_command(input);
+        input->length = 0;
+        input->discard_line = false;
+        return command;
+    }
+    if (byte == '\0' || input->length == sizeof(input->line) - 1) {
+        input->discard_line = true;
+    } else if (!input->discard_line) {
+        input->line[input->length++] = byte;
+    }
+    return TERMINAL_NONE;
 }

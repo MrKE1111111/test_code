@@ -1,0 +1,1 @@
+/usr/bin/cc CMakeFiles/bxi_oldtest.dir/motor_aging.c.o CMakeFiles/bxi_oldtest.dir/terminal.c.o -o bxi_oldtest  /home/bxi/bxi_ws/bxi_pci_drv-main/lib/libbxi_pci_drv.a 

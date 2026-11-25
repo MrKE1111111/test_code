@@ -1,0 +1,3 @@
+/home/bxi/bxi_ws/test_code/bxi_oldtest/build/CMakeFiles/bxi_oldtest.dir
+/home/bxi/bxi_ws/test_code/bxi_oldtest/build/CMakeFiles/edit_cache.dir
+/home/bxi/bxi_ws/test_code/bxi_oldtest/build/CMakeFiles/rebuild_cache.dir
