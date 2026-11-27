@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
 
 enum { UNLIMITED_ROUNDS = -1 };
 
@@ -37,6 +38,10 @@ struct terminal_input {
 
 /* Returns 1 to run the selected mode, 0 for help or saved settings, -1 on error. */
 int terminal_parse(int argc, char *argv[], struct terminal_options *options);
+/* Keep test logs on the original streams and silence the driver's stdio. */
+int terminal_quiet_driver(void);
+FILE *terminal_log(bool error);
+void terminal_log_errno(const char *operation);
 void terminal_input_init(struct terminal_input *input);
 enum terminal_command terminal_wait_command(struct terminal_input *input, int timeout_ms);
 

@@ -22,6 +22,75 @@ enum {
     DEFAULT_ROUNDS = 3,
 };
 
+static FILE *log_output;
+static FILE *log_error;
+
+FILE *terminal_log(bool error)
+{
+    return error ? (log_error ? log_error : stderr) : (log_output ? log_output : stdout);
+}
+
+void terminal_log_errno(const char *operation)
+{
+    const int error = errno;
+    fprintf(terminal_log(true), "%s: %s\n", operation, strerror(error));
+}
+
+static FILE *copy_log_stream(int target_fd, int buffering)
+{
+    int copy_fd = fcntl(target_fd, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+    if (copy_fd < 0) {
+        return NULL;
+    }
+    FILE *stream = fdopen(copy_fd, "w");
+    if (stream == NULL) {
+        const int error = errno;
+        close(copy_fd);
+        errno = error;
+        return NULL;
+    }
+    setvbuf(stream, NULL, buffering, 0);
+    return stream;
+}
+
+int terminal_quiet_driver(void)
+{
+    if (fflush(NULL) == EOF) {
+        terminal_log_errno("Flush test logs");
+        return -1;
+    }
+    FILE *output = copy_log_stream(STDOUT_FILENO, _IOLBF);
+    if (output == NULL) {
+        terminal_log_errno("Save test output");
+        return -1;
+    }
+    FILE *error = copy_log_stream(STDERR_FILENO, _IONBF);
+    if (error == NULL) {
+        terminal_log_errno("Save test error output");
+        fclose(output);
+        return -1;
+    }
+
+    int null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    bool redirected = null_fd >= 0 && dup2(null_fd, STDOUT_FILENO) >= 0 &&
+                      dup2(null_fd, STDERR_FILENO) >= 0;
+    if (!redirected) {
+        const int redirect_error = errno;
+        fprintf(error, "Redirect PCI driver output: %s\n", strerror(redirect_error));
+    }
+    if (null_fd >= 0) {
+        close(null_fd);
+    }
+    if (!redirected) {
+        fclose(error);
+        fclose(output);
+        return -1;
+    }
+    log_output = output;
+    log_error = error;
+    return 0;
+}
+
 static void print_help(FILE *output, const char *program)
 {
     fprintf(output,
@@ -257,14 +326,14 @@ void terminal_input_init(struct terminal_input *input)
 {
     *input = (struct terminal_input){ .enabled = isatty(STDIN_FILENO) == 1 };
     if (input->enabled) {
-        puts("Type stop, start, or quit and press Enter.");
+        fputs("Type stop, start, or quit and press Enter.\n", terminal_log(false));
     }
 }
 
 static enum terminal_command parse_command(struct terminal_input *input)
 {
     if (input->discard_line) {
-        puts("Invalid command. Enter stop, start, or quit.");
+        fputs("Invalid command. Enter stop, start, or quit.\n", terminal_log(false));
         return TERMINAL_NONE;
     }
 
@@ -280,7 +349,7 @@ static enum terminal_command parse_command(struct terminal_input *input)
     if (strcmp(command, "start") == 0) return TERMINAL_START;
     if (strcmp(command, "quit") == 0) return TERMINAL_QUIT;
     if (*command != '\0') {
-        puts("Unknown command. Enter stop, start, or quit.");
+        fputs("Unknown command. Enter stop, start, or quit.\n", terminal_log(false));
     }
     return TERMINAL_NONE;
 }
@@ -291,7 +360,7 @@ enum terminal_command terminal_wait_command(struct terminal_input *input, int ti
     int ready = poll(&fd, 1, timeout_ms);
     if (ready == 0 || (ready < 0 && errno == EINTR)) return TERMINAL_NONE;
     if (ready < 0) {
-        perror("Poll terminal input");
+        terminal_log_errno("Poll terminal input");
         return TERMINAL_ERROR;
     }
     if (!(fd.revents & POLLIN)) {
@@ -303,7 +372,7 @@ enum terminal_command terminal_wait_command(struct terminal_input *input, int ti
     ssize_t count = read(STDIN_FILENO, &byte, 1);
     if (count < 0) {
         if (errno == EINTR || errno == EAGAIN) return TERMINAL_NONE;
-        perror("Read terminal input");
+        terminal_log_errno("Read terminal input");
         return TERMINAL_ERROR;
     }
     if (count == 0) {

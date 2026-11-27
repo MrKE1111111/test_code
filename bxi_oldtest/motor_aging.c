@@ -49,7 +49,7 @@ static int read_time(const struct test_run *run, struct timespec *value)
     if (run->dry_run) {
         *value = run->simulated_time;
     } else if (clock_gettime(CLOCK_MONOTONIC, value) != 0) {
-        perror("clock_gettime");
+        terminal_log_errno("clock_gettime");
         return -1;
     }
     return 0;
@@ -68,7 +68,8 @@ static int verify_power_output(const struct test_run *run, unsigned expected)
 {
     int output = read_power_output(run);
     if (output != (int)expected) {
-        fprintf(stderr, "Power output GPIO2 mismatch: expected=%u read=%d\n", expected, output);
+        fprintf(terminal_log(true), "Power output GPIO2 mismatch: expected=%u read=%d\n",
+                expected, output);
         return -1;
     }
     return 0;
@@ -79,7 +80,7 @@ static int set_power(struct test_run *run, unsigned power, const char *phase)
     if (run->dry_run) {
         run->simulated_power = power;
     } else if (motor_pwr_set(power) != 0) {
-        fprintf(stderr, "%s: motor_pwr_set(%u) failed\n", phase, power);
+        fprintf(terminal_log(true), "%s: motor_pwr_set(%u) failed\n", phase, power);
         return -1;
     }
     if (read_time(run, &run->switched_at) != 0 || verify_power_output(run, power) != 0) {
@@ -88,11 +89,12 @@ static int set_power(struct test_run *run, unsigned power, const char *phase)
 
     const double elapsed_s = (double)(run->switched_at.tv_sec - run->started_at.tv_sec) +
         (double)(run->switched_at.tv_nsec - run->started_at.tv_nsec) / 1e9;
-    printf("t=%9.3f s %s power=%s gpio2=%u", elapsed_s, phase, power ? "ON" : "OFF", power);
+    FILE *output = terminal_log(false);
+    fprintf(output, "t=%9.3f s %s power=%s gpio2=%u", elapsed_s, phase, power ? "ON" : "OFF", power);
     if (!run->dry_run) {
-        printf(" gpio0=%d", motor_pwr_get());
+        fprintf(output, " gpio0=%d", motor_pwr_get());
     }
-    putchar('\n');
+    fputc('\n', output);
     return 0;
 }
 
@@ -141,7 +143,7 @@ static int wait_power(struct test_run *run, unsigned power, unsigned duration_s)
             return -1;
         }
         if (command == TERMINAL_QUIT) {
-            puts("Quit requested.");
+            fputs("Quit requested.\n", terminal_log(false));
             return 1;
         }
         if (command == TERMINAL_STOP && !paused) {
@@ -153,7 +155,8 @@ static int wait_power(struct test_run *run, unsigned power, unsigned duration_s)
             paused = true;
             next_check_ns = now_ns + ns_per_second;
             if (timed) {
-                printf("Phase time remaining: %.3f s\n", (double)remaining_ns / ns_per_second);
+                fprintf(terminal_log(false), "Phase time remaining: %.3f s\n",
+                        (double)remaining_ns / ns_per_second);
             }
         } else if (command == TERMINAL_START && paused) {
             if (set_power(run, power, "Resumed") != 0) {
@@ -203,7 +206,7 @@ static int run_test(struct test_run *run, const struct terminal_options *options
     }
     int initial_output = read_power_output(run);
     if (initial_output < 0) {
-        fputs("Cannot read initial power output GPIO2\n", stderr);
+        fputs("Cannot read initial power output GPIO2\n", terminal_log(true));
         return -1;
     }
     if (initial_output == 1 && options->mode != TEST_MODE_CONTINUOUS) {
@@ -264,7 +267,7 @@ static int run_test(struct test_run *run, const struct terminal_options *options
     }
     const double elapsed_s = (double)(finished_at.tv_sec - run->started_at.tv_sec) +
         (double)(finished_at.tv_nsec - run->started_at.tv_nsec) / 1e9;
-    printf("t=%9.3f s Schedule complete. Maintaining power ON.\n", elapsed_s);
+    fprintf(terminal_log(false), "t=%9.3f s Schedule complete. Maintaining power ON.\n", elapsed_s);
     run->switched_at = finished_at;
     return wait_power(run, 1, 0);
 }
@@ -290,15 +293,18 @@ int main(int argc, char **argv)
         perror("sigaction");
         return 1;
     }
+    if (terminal_quiet_driver() != 0) {
+        return 1;
+    }
     if (bxi_pci_init(discard_can_frame, NULL, -1) != 0) {
-        fputs("BXI PCI initialization failed.\n", stderr);
+        fputs("BXI PCI initialization failed.\n", terminal_log(true));
         return 1;
     }
 
     terminal_input_init(&run.input);
     int status = run_test(&run, &options);
     if (status > 0 && stop_signal) {
-        printf("Stop requested by signal %d.\n", (int)stop_signal);
+        fprintf(terminal_log(false), "Stop requested by signal %d.\n", (int)stop_signal);
     }
     int power_off_status = set_power(&run, 0, "Shutdown");
     bxi_pci_exit();
